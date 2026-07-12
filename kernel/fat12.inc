@@ -2,18 +2,18 @@
 ; PPP OS FAT12 文件系统
 ; ================================================================
 
-cwd_cluster dw 0                    ; 当前工作目录的起始簇号 (0 表示根目录)
+cwd_cluster dw 0                    ; 当前工作目录的起始簇号（0 表示根目录）
 
 ; ----------------------------------------------------------------
 ; 切换当前工作目录
-; 输入: DS:SI = 目录名 (FAT 8.3 格式)
-; 输出: CF=0 成功, CWD 更新; CF=1 失败
+; 输入: DS:SI = 目录名（FAT 8.3 格式，11 字节）
+; 输出: CF=0 成功，CWD 更新为目录簇号；CF=1 失败（非目录或不存在）
 ; ----------------------------------------------------------------
 fat12_change_dir:
     pusha
-    call fat12_find_file
+    call fat12_find_file            ; 查找目录项
     jc .cd_fail
-    test dl, 0x10                   ; 检查是否为目录属性
+    test dl, 0x10                   ; 检查属性中的目录位
     jz .cd_fail
     mov [cs:cwd_cluster], ax        ; 更新当前目录簇号
     popa
@@ -25,9 +25,9 @@ fat12_change_dir:
     ret
 
 ; ----------------------------------------------------------------
-; 在 FAT12 文件系统中查找文件/目录
-; 输入: DS:SI = 文件名 (11字节, 8.3格式)
-; 输出: CF=0 成功, AX=起始簇号, CX=文件大小, DL=属性; CF=1 未找到
+; 在 FAT12 文件系统中查找文件或目录
+; 输入: DS:SI = 文件名（11 字节，8.3 格式）
+; 输出: CF=0 成功，AX=起始簇号，CX=文件大小，DL=属性；CF=1 未找到
 ; ----------------------------------------------------------------
 fat12_find_file:
     push bx
@@ -36,73 +36,121 @@ fat12_find_file:
 
     mov ax, [cs:cwd_cluster]
     or ax, ax
-    jnz .search_subdir
+    jnz .search_subdir              ; 非零则搜索子目录
 
 .search_root:
-    mov ax, 19                      ; 根目录起始扇区 (LBA)
-    mov cx, 14                      ; 根目录占用14个扇区
-    mov bx, 0x7000                  ; 加载到段 0x7000
+    ; 根目录位于 LBA 19，占 14 个扇区，共 224 个条目
+    mov ax, 19
+    mov cx, 14
+    mov bx, 0x7000                  ; 暂存段 0x7000
     mov es, bx
     xor bx, bx
     call disk_read_lba
-    mov cx, 224                     ; 根目录最大条目数
+    mov cx, 224
     jmp .do_search
 
 .search_subdir:
-    add ax, 31                      ; 数据区起始簇号偏移
-    mov cx, 1                       ; 子目录占1个扇区
+    ; 子目录：簇号转 LBA（数据区从簇 2 开始，LBA = 簇号 + 31）
+    push ax                         ; 保存当前簇号
+    add ax, 31
+    mov cx, 1                       ; 每簇 1 扇区
     mov bx, 0x7000
     mov es, bx
     xor bx, bx
     call disk_read_lba
-    mov cx, 16                      ; 子目录每扇区16个条目
+    mov cx, 16                      ; 每扇区 16 个目录项（32 字节/项）
 
 .do_search:
     xor bx, bx
 .search_loop:
-    mov al, [es:bx]                 ; 第一个字节: 文件名首字符
-    cmp al, 0x00                    ; 0x00 表示目录结束
-    je .not_found
-    cmp al, 0xE5                    ; 0xE5 表示已删除条目
-    je .next_entry
+    mov al, [es:bx]                 ; 目录项首字节
+    cmp al, 0x00                    
+    je .check_next_cluster          ; 0x00 表示此条目未用，但后面可能还有簇
+    cmp al, 0xE5                    
+    je .next_entry                  ; 0xE5 表示已删除项
     
     mov dl, [es:bx+11]              ; 属性字节
-    test dl, 0x08                   ; 跳过卷标 (0x08)
+    test dl, 0x08                   ; 跳过卷标（属性位 0x08）
     jnz .next_entry
 
+    ; 比较文件名（11 字节）
     push cx
     push si
     push di
     mov di, bx
     mov cx, 11
-    repe cmpsb                      ; 比较文件名 (11字节)
+    repe cmpsb
     pop di
     pop si
     pop cx
     je .found
 
 .next_entry:
-    add bx, 32                      ; 每个目录项32字节
+    add bx, 32                      ; 下一项
     loop .search_loop
 
+.check_next_cluster:
+    cmp word [cs:cwd_cluster], 0
+    je .not_found                   ; 根目录空间连续，找不到即不存在
+
+    ; 子目录：读取 FAT 表，获取下一簇
+    pop dx                          ; 恢复当前簇号
+    push es
+    mov ax, 0x6000
+    mov es, ax
+    mov ax, 1
+    mov cx, 9                       ; FAT 表占 9 扇区（从 LBA 1 开始）
+    push bx
+    xor bx, bx
+    call disk_read_lba              ; 加载 FAT 到 0x6000:0000
+    pop bx
+    
+    mov ax, dx
+    mov di, 3
+    mul di                          ; 簇号 * 3
+    shr ax, 1                       ; /2 得到字节偏移
+    mov di, ax
+    mov ax, [es:di]                 ; 读取 16 位
+    test dx, 1
+    jnz .odd_cluster
+    and ax, 0x0FFF                  ; 偶簇取低 12 位
+    jmp .eval_next
+.odd_cluster:
+    shr ax, 4                       ; 奇簇取高 12 位
+.eval_next:
+    pop es
+    cmp ax, 0x0FF8                  ; 是否 EOF（>=0xFF8）
+    jae .not_found
+    or ax, ax
+    jz .not_found                   ; 空闲簇（0）表示链断裂
+    jmp .search_subdir              ; 继续读取下一簇
+
 .not_found:
+    cmp word [cs:cwd_cluster], 0
+    je .ret_err
+    pop ax                          ; 平衡栈（之前 push ax）
+.ret_err:
     pop es
     pop bx
     stc
     ret
 
 .found:
-    mov ax, [es:bx + 26]            ; 起始簇号 (低16位)
-    mov cx, [es:bx + 28]            ; 文件大小
+    cmp word [cs:cwd_cluster], 0
+    je .get_info
+    pop dx                          ; 平衡栈
+.get_info:
+    mov ax, [es:bx + 26]            ; 起始簇号
+    mov cx, [es:bx + 28]            ; 文件大小（字节）
     pop es
     pop bx
     clc
     ret
 
 ; ----------------------------------------------------------------
-; 写入文件到 FAT12 文件系统 (若文件已存在则覆盖)
-; 输入: DS:SI = 文件名 (11字节), ES:DI = 数据缓冲区, CX = 文件大小
-; 输出: CF=0 成功, CF=1 失败 (磁盘满)
+; 写入文件到 FAT12（若文件已存在则覆盖）
+; 输入: DS:SI = 文件名（11 字节）, ES:DI = 数据缓冲区, CX = 文件大小
+; 输出: CF=0 成功，CF=1 失败（磁盘满）
 ; ----------------------------------------------------------------
 fat12_write_file:
     pusha
@@ -111,32 +159,32 @@ fat12_write_file:
     mov [cs:.data_ptr_seg], es
     mov [cs:.file_size], cx
     
-    call fat12_delete_file          ; 删除同名旧文件 (若存在)
-    
+    call fat12_delete_file          ; 先删除同名文件（实现覆盖）
+
     ; 计算所需扇区数
     mov ax, [cs:.file_size]
     add ax, 511
     shr ax, 9
     or ax, ax
     jnz .save_sec
-    inc ax                          ; 空文件至少占1扇区
+    inc ax                          ; 空文件也分配 1 扇区
 .save_sec:
     mov [cs:.sectors_left], ax
 
-    ; 读取 FAT 表到内存 (0x6000 段)
+    ; 加载 FAT 表到 0x6000
     push es
     mov ax, 0x6000
     mov es, ax
-    mov ax, 1                       ; FAT 起始扇区
-    mov cx, 9                       ; FAT 占9个扇区
+    mov ax, 1
+    mov cx, 9
     xor bx, bx
     call disk_read_lba
     pop es
 
     ; 扫描连续空闲簇
-    mov dx, 2                       ; 从簇2开始 (0,1 保留)
+    mov dx, 2                       ; FAT12 簇号从 2 开始
 .scan_fat:
-    cmp dx, 2848                    ; FAT12 最大簇号限制
+    cmp dx, 2848                    ; 最大簇号（磁盘总簇数）
     jae .disk_full
 
     mov cx, [cs:.sectors_left]
@@ -147,28 +195,28 @@ fat12_write_file:
     mov ax, di
     mov bx, 3
     mul bx
-    shr ax, 1                       ; 计算 FAT 表项字节偏移
+    shr ax, 1
     mov bx, ax
     push ds
     mov ax, 0x6000
     mov ds, ax
-    mov ax, [bx]                    ; 读取12位表项
+    mov ax, [bx]
     pop ds
     test di, 1
     jnz .odd_cluster
 .even_cluster:
-    and ax, 0x0FFF                  ; 偶数字节: 取低12位
+    and ax, 0x0FFF
     jmp .check_free
 .odd_cluster:
-    shr ax, 4                       ; 奇数字节: 取高12位
+    shr ax, 4
 .check_free:
     pop cx
     pop dx
     or ax, ax
-    jnz .seq_broken                 ; 非0表示该簇已占用
+    jnz .seq_broken                 ; 非零表示已被占用
     inc di
     loop .check_seq
-    jmp .found_cluster              ; 找到足够的连续空闲簇
+    jmp .found_cluster              ; 找到足够连续空闲簇
 
 .seq_broken:
     inc dx
@@ -179,7 +227,7 @@ fat12_write_file:
     mov cx, [cs:.sectors_left]
     mov di, dx
     
-    ; 写入 FAT 链
+    ; 更新 FAT 链
 .link_loop:
     push cx
     mov ax, di
@@ -191,10 +239,10 @@ fat12_write_file:
     cmp cx, 1
     je .write_eof
     mov dx, di
-    inc dx                          ; 下一簇
+    inc dx                          ; 下一簇指针
     jmp .do_fat_write
 .write_eof:
-    mov dx, 0x0FFF                  ; EOF 标记 (0xFFF)
+    mov dx, 0x0FFF                  ; EOF 标记
 
 .do_fat_write:
     push ds
@@ -205,14 +253,14 @@ fat12_write_file:
     test di, 1
     jnz .mark_odd
 .mark_even:
-    and ax, 0xF000                  ; 保留高4位
-    or ax, dx                       ; 写入12位值
+    and ax, 0xF000
+    or ax, dx
     jmp .write_back
 .mark_odd:
-    and ax, 0x000F                  ; 保留低4位
+    and ax, 0x000F
     push cx
     mov cx, dx
-    shl cx, 4                       ; 左移4位到高12位位置
+    shl cx, 4
     or ax, cx
     pop cx
 .write_back:
@@ -225,7 +273,7 @@ fat12_write_file:
     jmp .link_loop
 
 .link_done:
-    ; 写回 FAT 表 (两份备份)
+    ; 写回 FAT（第一份和第二份）
     push es
     mov ax, 0x6000
     mov es, ax
@@ -233,12 +281,12 @@ fat12_write_file:
     mov cx, 9
     xor bx, bx
     call disk_write_lba
-    mov ax, 10                      ; FAT 备份
+    mov ax, 10
     mov cx, 9
     call disk_write_lba
     pop es
 
-    ; 在父目录中创建目录项
+    ; 加载目录表
     push es
     mov ax, 0x7000
     mov es, ax
@@ -247,17 +295,17 @@ fat12_write_file:
     jnz .w_read_sub
     mov ax, 19
     mov cx, 14
-    mov dx, 224                     ; 根目录条目数
+    mov dx, 224
     jmp .w_do_read
 .w_read_sub:
     add ax, 31
     mov cx, 1
-    mov dx, 16                      ; 子目录条目数
+    mov dx, 16
 .w_do_read:
     xor bx, bx
     call disk_read_lba
 
-    ; 扫描空闲目录项
+    ; 寻找空闲目录项
     xor bx, bx
     mov cx, dx
 .scan_dir:
@@ -269,29 +317,30 @@ fat12_write_file:
     add bx, 32
     loop .scan_dir
     pop es
-    jmp .disk_full                  ; 目录已满
+    jmp .disk_full
 
 .found_dir_entry:
+    ; 写入目录项
     push di
     push si
     push cx
     mov di, bx
     mov cx, 11
-    rep movsb                       ; 复制文件名
+    rep movsb                      ; 复制文件名
     mov cx, 21
     xor al, al
-    rep stosb                       ; 清空其余字段
-    mov byte [es:bx+11], 0x20       ; 属性: 普通文件 (0x20)
+    rep stosb                      ; 清零剩余字段
+    mov byte [es:bx+11], 0x20      ; 属性：归档
     mov ax, [cs:.new_cluster]
-    mov [es:bx+26], ax              ; 起始簇号
+    mov [es:bx+26], ax
     mov ax, [cs:.file_size]
-    mov [es:bx+28], ax              ; 文件大小
-    mov word [es:bx+30], 0          ; 时间戳 (简化)
+    mov [es:bx+28], ax
+    mov word [es:bx+30], 0
     pop cx
     pop si
     pop di
 
-    ; 写回目录扇区
+    ; 写回目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .w_write_sub
@@ -312,7 +361,7 @@ fat12_write_file:
     mov ax, [cs:.sectors_left]
     mov cx, ax
     mov ax, [cs:.new_cluster]
-    add ax, 31                      ; 转换为 LBA (数据区起始偏移31)
+    add ax, 31                     ; 簇号转 LBA
     mov es, [cs:.data_ptr_seg]
     mov bx, [cs:.data_ptr_off]
     call disk_write_lba
@@ -326,6 +375,7 @@ fat12_write_file:
     stc
     ret
 
+; 局部变量
 .new_cluster  dw 0
 .file_size    dw 0
 .data_ptr_off dw 0
@@ -333,9 +383,9 @@ fat12_write_file:
 .sectors_left dw 0
 
 ; ----------------------------------------------------------------
-; 删除文件 (释放 FAT 簇链)
-; 输入: DS:SI = 文件名 (11字节)
-; 输出: CF=0 成功, CF=1 失败
+; 删除文件（释放 FAT 簇链）
+; 输入: DS:SI = 文件名（11 字节）
+; 输出: CF=0 成功，CF=1 失败（文件不存在）
 ; ----------------------------------------------------------------
 fat12_delete_file:
     pusha
@@ -344,7 +394,7 @@ fat12_delete_file:
     mov ax, 0x7000
     mov es, ax
     
-    ; 读取当前目录到 0x7000
+    ; 加载目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .d_read_sub
@@ -360,7 +410,7 @@ fat12_delete_file:
     xor bx, bx
     call disk_read_lba
 
-    ; 在目录中查找文件
+    ; 搜索文件名
     mov cx, dx
     xor bx, bx
 .del_search:
@@ -370,7 +420,7 @@ fat12_delete_file:
     cmp al, 0xE5
     je .del_next
     mov al, [es:bx+11]
-    test al, 0x08                   ; 跳过卷标
+    test al, 0x08
     jnz .del_next
 
     push cx
@@ -393,12 +443,12 @@ fat12_delete_file:
     ret
 
 .del_found:
-    ; 标记目录项为已删除
+    ; 标记目录项为删除
     mov byte [es:bx], 0xE5
     mov dx, [es:bx+26]              ; 获取起始簇号
     push dx
     
-    ; 写回目录扇区
+    ; 写回目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .d_write_sub
@@ -415,9 +465,9 @@ fat12_delete_file:
     pop bx
     pop dx
     cmp dx, 2
-    jb .del_done                    ; 保留簇0,1不处理
+    jb .del_done                    ; 无效簇，无需释放
 
-    ; 读取 FAT 表
+    ; 加载 FAT 表
     mov ax, 0x6000
     mov es, ax
     mov ax, 1
@@ -426,7 +476,7 @@ fat12_delete_file:
     xor bx, bx
     call disk_read_lba
 
-    ; 遍历并释放 FAT 链
+    ; 遍历并释放簇链
 .free_loop:
     mov ax, dx
     mov bx, 3
@@ -438,30 +488,30 @@ fat12_delete_file:
     test dx, 1
     jnz .free_odd
 .free_even:
-    and ax, 0xF000                  ; 保留高4位
+    and ax, 0xF000
     jmp .write_free
 .free_odd:
-    and ax, 0x000F                  ; 保留低4位
+    and ax, 0x000F
 .write_free:
-    mov [es:bx], ax                 ; 清除簇标记 (置0)
+    mov [es:bx], ax                 ; 将当前簇标记为 0（空闲）
     pop ax
     test dx, 1
     jnz .get_odd
 .get_even:
-    and ax, 0x0FFF                  ; 获取下一簇号
+    and ax, 0x0FFF
     jmp .check_next
 .get_odd:
     shr ax, 4
 .check_next:
     mov dx, ax
     cmp dx, 0x0FF8
-    jae .free_done                  ; 到达 EOF
+    jae .free_done
     or dx, dx
     jz .free_done
     jmp .free_loop
 
 .free_done:
-    ; 写回 FAT 表
+    ; 写回 FAT 两份
     mov ax, 1
     mov cx, 9
     xor bx, bx
@@ -478,8 +528,8 @@ fat12_delete_file:
 
 ; ----------------------------------------------------------------
 ; 重命名文件
-; 输入: DS:SI = 旧文件名, ES:DI = 新文件名 (均为11字节)
-; 输出: CF=0 成功, CF=1 失败
+; 输入: DS:SI = 旧文件名（11 字节）, ES:DI = 新文件名（11 字节）
+; 输出: CF=0 成功，CF=1 失败（旧文件不存在）
 ; ----------------------------------------------------------------
 fat12_rename_file:
     pusha
@@ -488,7 +538,7 @@ fat12_rename_file:
     mov ax, 0x7000
     mov es, ax
     
-    ; 读取当前目录
+    ; 加载目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .r_read_sub
@@ -504,7 +554,7 @@ fat12_rename_file:
     xor bx, bx
     call disk_read_lba
 
-    ; 查找旧文件名
+    ; 搜索旧文件名
     mov cx, dx
     xor bx, bx
 .ren_search:
@@ -537,19 +587,19 @@ fat12_rename_file:
     ret
 
 .ren_found:
-    ; 用新文件名覆盖旧文件名
+    ; 覆盖写入新文件名
     push cx
     push si
     push di
-    mov si, di                      ; 新文件名在 ES:DI
-    mov di, bx                      ; 目标目录项
+    mov si, di                      ; ES:DI 指向新名字
+    mov di, bx                      ; 目标目录项偏移
     mov cx, 11
     rep movsb
     pop di
     pop si
     pop cx
 
-    ; 写回目录扇区
+    ; 写回目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .r_write_sub
@@ -571,14 +621,14 @@ fat12_rename_file:
 
 ; ----------------------------------------------------------------
 ; 创建目录
-; 输入: DS:SI = 目录名 (11字节)
-; 输出: CF=0 成功, CF=1 失败 (磁盘满)
+; 输入: DS:SI = 目录名（11 字节）
+; 输出: CF=0 成功，CF=1 失败（磁盘满）
 ; ----------------------------------------------------------------
 fat12_make_dir:
     pusha
     cld
 
-    ; 1. 扫描并分配空闲簇
+    ; 加载 FAT 表
     push es
     mov ax, 0x6000
     mov es, ax
@@ -588,6 +638,7 @@ fat12_make_dir:
     call disk_read_lba
     pop es
 
+    ; 扫描一个空闲簇
     mov dx, 2
 .scan_fat:
     cmp dx, 2848
@@ -623,7 +674,7 @@ fat12_make_dir:
 .found_cluster:
     mov [cs:.new_cluster], dx
 
-    ; 在 FAT 中标记为 EOF
+    ; 标记该簇为 EOF (0xFFF)
     mov ax, dx
     mov bx, 3
     mul bx
@@ -647,7 +698,7 @@ fat12_make_dir:
     mov [bx], ax
     pop ds
 
-    ; 写回 FAT 表
+    ; 写回 FAT
     push es
     mov ax, 0x6000
     mov es, ax
@@ -659,16 +710,16 @@ fat12_make_dir:
     call disk_write_lba
     pop es
 
-    ; 2. 初始化新目录簇 (包含 "." 和 ".." 条目)
+    ; 初始化目录块（包含 "." 和 ".." 条目）
     push es
     mov ax, 0x5000
     mov es, ax
-    mov cx, 256
+    mov cx, 256                     ; 1 扇区（512 字节 = 16 项 * 32）
     xor di, di
     xor ax, ax
-    rep stosw                       ; 清零512字节
+    rep stosw                       ; 清空
 
-    ; 写入 "." 条目
+    ; "." 目录项
     mov di, 0
     mov al, '.'
     mov [es:di], al
@@ -678,9 +729,9 @@ fat12_make_dir:
     rep stosb
     mov byte [es:11], 0x10          ; 目录属性
     mov ax, [cs:.new_cluster]
-    mov [es:26], ax                 ; 指向自身
+    mov [es:26], ax                 ; 起始簇号
 
-    ; 写入 ".." 条目
+    ; ".." 目录项
     mov di, 32
     mov al, '.'
     mov [es:di], al
@@ -689,11 +740,11 @@ fat12_make_dir:
     mov cx, 9
     add di, 2
     rep stosb
-    mov byte [es:32+11], 0x10       ; 目录属性
+    mov byte [es:32+11], 0x10
     mov ax, [cs:cwd_cluster]
-    mov [es:32+26], ax              ; 指向父目录
+    mov [es:32+26], ax              ; 父目录簇号
 
-    ; 写入新簇到磁盘
+    ; 写入目录块到数据区
     mov ax, [cs:.new_cluster]
     add ax, 31
     mov cx, 1
@@ -701,7 +752,7 @@ fat12_make_dir:
     call disk_write_lba
     pop es
 
-    ; 3. 在父目录中注册新目录项
+    ; 加载父目录表
     push es
     mov ax, 0x7000
     mov es, ax
@@ -720,7 +771,7 @@ fat12_make_dir:
     xor bx, bx
     call disk_read_lba
 
-    ; 查找空闲目录项
+    ; 在父目录中查找空闲项
     mov cx, dx
     xor bx, bx
 .scan_dir:
@@ -731,31 +782,30 @@ fat12_make_dir:
     je .found_dir_entry
     add bx, 32
     loop .scan_dir
-
     pop es
     jmp .disk_full
 
 .found_dir_entry:
+    ; 写入新目录的目录项
     push di
     push si
     push cx
     mov di, bx
     mov cx, 11
-    rep movsb                       ; 复制目录名
+    rep movsb                      ; 复制目录名
     mov cx, 21
     xor al, al
     rep stosb
-
-    mov byte [es:bx+11], 0x10       ; 目录属性
+    mov byte [es:bx+11], 0x10      ; 属性：目录
     mov ax, [cs:.new_cluster]
-    mov [es:bx+26], ax              ; 起始簇号
-    mov word [es:bx+28], 0          ; 目录大小固定为0
+    mov [es:bx+26], ax
+    mov word [es:bx+28], 0
     mov word [es:bx+30], 0
     pop cx
     pop si
     pop di
 
-    ; 写回父目录扇区
+    ; 写回父目录表
     mov ax, [cs:cwd_cluster]
     or ax, ax
     jnz .w_write_sub
